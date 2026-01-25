@@ -1,25 +1,14 @@
 services:
   nemotron:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        # Optional (only needed for private/gated models). Leaving blank is fine for public.
-        HF_TOKEN: ""
+    image: docdbrown/nvidia-nemotron-nano-9b-v2:1.0.0
     container_name: nemotron
     network_mode: host
     shm_size: "8gb"
     restart: unless-stopped
     init: true
-    runtime: nvidia
 
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # Prefer this with modern Docker Compose + NVIDIA Container Toolkit
+    gpus: all
 
     environment:
       NVIDIA_VISIBLE_DEVICES: all

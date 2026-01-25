@@ -1,14 +1,15 @@
+# syntax=docker/dockerfile:1
 FROM dustynv/l4t-pytorch:r36.4.0
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG HF_TOKEN=""
 
-# Use PyPI for general packages; Jetson wheel index only when explicitly used
+# Cache locations inside the image
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_DEFAULT_TIMEOUT=180 \
     PIP_RETRIES=10 \
     PIP_INDEX_URL=https://pypi.org/simple \
-    # Bake HF cache into the image here:
     HF_HOME=/opt/hf \
     HF_HUB_CACHE=/opt/hf/hub \
     TORCH_HOME=/opt/torch \
@@ -16,75 +17,84 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 ARG JETSON_WHEELS=https://pypi.jetson-ai-lab.io/jp6/cu126
 
-# Optional: allow pulling private/gated repos during build
-# WARNING: if you pass this as a build-arg, it can end up in image history.
-ARG HF_TOKEN=""
+WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git build-essential cmake ninja-build pkg-config python3-dev \
-      libopenblas-dev libffi-dev ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN <<'BASH'
+set -eux
 
-RUN python3 -m pip install -U pip setuptools wheel
+apt-get update
+apt-get install -y --no-install-recommends \
+  git build-essential cmake ninja-build pkg-config python3-dev \
+  libopenblas-dev libffi-dev ca-certificates
+rm -rf /var/lib/apt/lists/*
 
-# Model/runtime deps from PyPI
-RUN python3 -m pip install \
-      "transformers==4.48.3" \
-      "accelerate>=0.30.0" \
-      safetensors sentencepiece huggingface_hub
+python3 -m pip install -U pip setuptools wheel
+
+# Model/runtime deps
+python3 -m pip install \
+  "transformers==4.48.3" \
+  "accelerate>=0.30.0" \
+  safetensors sentencepiece huggingface_hub
 
 # Web server deps
-RUN python3 -m pip install fastapi uvicorn
+python3 -m pip install fastapi uvicorn
 
-# Quantization (try Jetson wheels first, fall back)
-RUN python3 -m pip install --extra-index-url ${JETSON_WHEELS} bitsandbytes || \
-    python3 -m pip install bitsandbytes || true
+# Quantization (best effort)
+python3 -m pip install --extra-index-url "${JETSON_WHEELS}" bitsandbytes || \
+python3 -m pip install bitsandbytes || true
 
-# Nemotron depends on mamba-ssm; try Jetson wheels first; fall back to build.
-RUN set -eux; \
-    if python3 -c "import mamba_ssm" 2>/dev/null; then \
-      echo "mamba_ssm already present"; \
-    else \
-      (python3 -m pip install --extra-index-url ${JETSON_WHEELS} "mamba-ssm[causal-conv1d]" --no-build-isolation) || ( \
-        echo "Jetson wheel install failed; attempting source build (may require nvcc)"; \
-        apt-get update; \
-        (apt-get install -y --no-install-recommends cuda-nvcc-12-6 cuda-toolkit-12-6) || true; \
-        rm -rf /var/lib/apt/lists/*; \
-        python3 -m pip install "mamba-ssm[causal-conv1d]" --no-build-isolation \
-      ); \
-    fi
+# Nemotron dependency (builds if no wheel)
+python3 -m pip install --extra-index-url "${JETSON_WHEELS}" "mamba-ssm[causal-conv1d]" --no-build-isolation || \
+python3 -m pip install "mamba-ssm[causal-conv1d]" --no-build-isolation
 
 # Optional: triton (not fatal)
-RUN python3 -m pip install --extra-index-url ${JETSON_WHEELS} triton || \
-    python3 -m pip install triton || true
+python3 -m pip install --extra-index-url "${JETSON_WHEELS}" triton || \
+python3 -m pip install triton || true
 
-# ----------------------------
-# PRE-DOWNLOAD MODEL AT BUILD
-# ----------------------------
-# snapshot_download will populate the HF cache under HF_HOME/HF_HUB_CACHE.
-# This is the supported way to prepare offline usage. :contentReference[oaicite:1]{index=1}
-RUN set -eux; \
-    python3 - <<'PY'
-import os
+# ---------------------------------------
+# Pre-download model into image cache
+# Make this robust:
+# - disable hf-xet (avoids CAS/xet failures)
+# - max_workers=1 and resume_download=True
+# - retry loop for transient network errors
+# ---------------------------------------
+HF_TOKEN="${HF_TOKEN}" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 HF_HUB_DISABLE_XET=1 python3 - <<'PY'
+import os, time
 from huggingface_hub import snapshot_download
 
 model_id = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
-
 token = os.environ.get("HF_TOKEN") or None
-# Download full repo into the Hugging Face cache inside the image
-snapshot_download(
-    repo_id=model_id,
-    token=token,
-)
-print("Downloaded:", model_id)
-PY
 
-WORKDIR /opt
-COPY server.py /opt/server.py
+last_err = None
+for attempt in range(1, 8):
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            token=token,
+            resume_download=True,
+            max_workers=1,
+        )
+        print("Downloaded:", model_id)
+        last_err = None
+        break
+    except Exception as e:
+        last_err = e
+        # Backoff: 10s, 20s, ... 70s
+        sleep_s = 10 * attempt
+        print(f"[snapshot_download] attempt {attempt}/7 failed: {type(e).__name__}: {e}")
+        print(f"[snapshot_download] sleeping {sleep_s}s then retrying...")
+        time.sleep(sleep_s)
+
+if last_err is not None:
+    raise last_err
+PY
+BASH
+
+COPY server.py /app/server.py
 
 EXPOSE 8000
 
-# Force offline at runtime: no HTTP calls; only cached files are used. :contentReference[oaicite:2]{index=2}
+# Runtime offline (no HTTP calls); relies on baked cache
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 

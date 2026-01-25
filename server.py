@@ -12,11 +12,13 @@ _model = None
 _tokenizer = None
 _lock = threading.Lock()
 
+
 class GenerateRequest(BaseModel):
     prompt: str
     max_new_tokens: int = 128
     do_sample: bool = False
     temperature: float = 0.7
+
 
 def _cuda_status():
     if not torch.cuda.is_available():
@@ -29,39 +31,40 @@ def _cuda_status():
         "total_gib": round(total_b / 1024**3, 2),
     }
 
+
 def _load_once():
     global _model, _tokenizer
     if _model is not None and _tokenizer is not None:
         return
 
-    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if _tokenizer.pad_token_id is None and _tokenizer.eos_token_id is not None:
+        _tokenizer.pad_token_id = _tokenizer.eos_token_id
 
     model_kwargs = dict(
         trust_remote_code=True,
         device_map="auto",
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
     )
 
-    # Prefer 8-bit on 16GB devices if bitsandbytes is usable.
-    use_bnb = False
+    # Prefer 8-bit if bitsandbytes is available.
     try:
         import bitsandbytes  # noqa: F401
-        use_bnb = True
-    except Exception:
-        use_bnb = False
-
-    if use_bnb:
         from transformers import BitsAndBytesConfig
+
         model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        model_kwargs["torch_dtype"] = torch.float16
-    else:
-        model_kwargs["torch_dtype"] = torch.float16
+    except Exception:
+        pass
 
     _model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
     _model.eval()
 
+
 @app.get("/health")
 def health():
     return {"ok": True, **_cuda_status()}
+
 
 @app.post("/generate")
 def generate(req: GenerateRequest):
@@ -69,7 +72,7 @@ def generate(req: GenerateRequest):
         _load_once()
 
         messages = [
-            {"role": "system", "content": "/think"},
+            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": req.prompt},
         ]
 
@@ -80,19 +83,24 @@ def generate(req: GenerateRequest):
             return_tensors="pt",
         )
 
-        if hasattr(_model, "device") and isinstance(_model.device, torch.device):
-            inputs = inputs.to(_model.device)
+        if torch.cuda.is_available():
+            inputs = inputs.to("cuda")
 
         gen_kwargs = dict(
             max_new_tokens=req.max_new_tokens,
             do_sample=req.do_sample,
+            temperature=req.temperature if req.do_sample else None,
             eos_token_id=_tokenizer.eos_token_id,
+            pad_token_id=_tokenizer.pad_token_id,
         )
-        if req.do_sample:
-            gen_kwargs["temperature"] = req.temperature
+        # remove None temperature when not sampling
+        if not req.do_sample:
+            gen_kwargs.pop("temperature", None)
 
         with torch.inference_mode():
             out = _model.generate(inputs, **gen_kwargs)
 
-        text = _tokenizer.decode(out[0], skip_special_tokens=False)
+        # Return only newly generated tokens (not the prompt)
+        new_tokens = out[0][inputs.shape[-1]:]
+        text = _tokenizer.decode(new_tokens, skip_special_tokens=True)
         return {"text": text}
