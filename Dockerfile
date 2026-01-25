@@ -19,54 +19,67 @@ ARG JETSON_WHEELS=https://pypi.jetson-ai-lab.io/jp6/cu126
 
 WORKDIR /app
 
-RUN <<'BASH'
+# --------------------------------------------------------
+# Install OS build tools + Python deps
+# --------------------------------------------------------
+RUN << 'BASH'
 set -eux
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  git build-essential cmake ninja-build pkg-config python3-dev \
-  libopenblas-dev libffi-dev ca-certificates
+    git build-essential cmake ninja-build pkg-config python3-dev \
+    libopenblas-dev libffi-dev ca-certificates
+
 rm -rf /var/lib/apt/lists/*
 
 python3 -m pip install -U pip setuptools wheel
 
-# Model/runtime deps
+# --------------------------------------------------------
+# Model and runtime deps
+# --------------------------------------------------------
 python3 -m pip install \
-  "transformers==4.48.3" \
-  "accelerate>=0.30.0" \
-  safetensors sentencepiece huggingface_hub
+    "transformers==4.48.3" \
+    "accelerate>=0.30.0" \
+    safetensors sentencepiece huggingface_hub
 
+# --------------------------------------------------------
 # Web server deps
+# --------------------------------------------------------
 python3 -m pip install fastapi uvicorn
 
+# --------------------------------------------------------
 # Quantization (best effort)
+# --------------------------------------------------------
 python3 -m pip install --extra-index-url "${JETSON_WHEELS}" bitsandbytes || \
-python3 -m pip install bitsandbytes || true
+    python3 -m pip install bitsandbytes || true
 
-# Nemotron dependency (builds if no wheel)
-python3 -m pip install --extra-index-url "${JETSON_WHEELS}" "mamba-ssm[causal-conv1d]" --no-build-isolation || \
-python3 -m pip install "mamba-ssm[causal-conv1d]" --no-build-isolation
+# --------------------------------------------------------
+# Install causal-conv1d first
+# --------------------------------------------------------
+python3 -m pip install causal-conv1d>=1.4.0 --no-build-isolation
 
-# Optional: triton (not fatal)
+# --------------------------------------------------------
+# Install mamba-ssm with causal-conv1d extras and force build
+# - disable isolation to ensure it sees the system CUDA + PyTorch
+# --------------------------------------------------------
+python3 -m pip install mamba-ssm[causal-conv1d] --no-build-isolation
+
+# Optional: triton (not fatal, but sometimes needed for kernels)
 python3 -m pip install --extra-index-url "${JETSON_WHEELS}" triton || \
-python3 -m pip install triton || true
+    python3 -m pip install triton || true
 
-# ---------------------------------------
-# Pre-download model into image cache
-# Make this robust:
-# - disable hf-xet (avoids CAS/xet failures)
-# - max_workers=1 and resume_download=True
-# - retry loop for transient network errors
-# ---------------------------------------
-HF_TOKEN="${HF_TOKEN}" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 HF_HUB_DISABLE_XET=1 python3 - <<'PY'
+# --------------------------------------------------------
+# Pre-download model into HF cache
+# --------------------------------------------------------
+HF_TOKEN="${HF_TOKEN}" HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 HF_HUB_DISABLE_XET=1 python3 - << 'PY'
 import os, time
 from huggingface_hub import snapshot_download
 
-model_id = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
-token = os.environ.get("HF_TOKEN") or None
+model_id="nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+token=os.environ.get("HF_TOKEN") or None
+last_err=None
 
-last_err = None
-for attempt in range(1, 8):
+for attempt in range(1,8):
     try:
         snapshot_download(
             repo_id=model_id,
@@ -75,18 +88,15 @@ for attempt in range(1, 8):
             max_workers=1,
         )
         print("Downloaded:", model_id)
-        last_err = None
+        last_err=None
         break
     except Exception as e:
-        last_err = e
-        # Backoff: 10s, 20s, ... 70s
-        sleep_s = 10 * attempt
-        print(f"[snapshot_download] attempt {attempt}/7 failed: {type(e).__name__}: {e}")
-        print(f"[snapshot_download] sleeping {sleep_s}s then retrying...")
+        last_err=e
+        sleep_s=10*attempt
+        print(f"[snapshot_download] attempt {attempt}/7 failed: {e}")
         time.sleep(sleep_s)
 
-if last_err is not None:
-    raise last_err
+if last_err: raise last_err
 PY
 BASH
 
@@ -99,3 +109,4 @@ ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+
